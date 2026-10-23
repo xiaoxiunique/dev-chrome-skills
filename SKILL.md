@@ -1,10 +1,12 @@
 ---
 name: dev-chrome-skills
 description: |
-  DevChromeSkills —— 用 devchrome CLI 统一管理本机 Debug Chrome 实例（Dev Profile：独立数据目录 + 调试端口 + 可选代理）。
-  任何需要用 Chrome 浏览器完成的任务（打开网页、登录、抓 Cookie、CDP / chrome-devtools MCP / js-reverse MCP
-  调试、爬虫逆向、自动化）都必须先用本 skill 查询、创建、启动实例，禁止自己另起 Chrome 或用临时 user-data-dir。
-  用户提到「Debug Chrome」「调试浏览器」「9222」「远程调试端口」「CDP」「chrome-devtools MCP」「开个浏览器」时使用。
+  Manage local Debug Chrome instances ("Dev Profiles": isolated user-data-dir + CDP debug port + optional proxy) with the devchrome CLI.
+  Any task that needs a Chrome browser (opening pages, logging in, reading/writing cookies, CDP / chrome-devtools MCP / js-reverse MCP
+  debugging, crawling, reverse engineering, automation) MUST use this skill to list, create and start an instance first — never launch
+  Chrome yourself or use a temporary user-data-dir. Also supports driving several instances in parallel (devchrome cdp <profile|port> <tool>).
+  Use when the user mentions Debug Chrome, debugging browser, 9222, remote debugging port, CDP, chrome-devtools MCP,
+  「调试浏览器」「开个浏览器」.
 ---
 
 # DevChromeSkills
