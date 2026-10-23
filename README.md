@@ -16,6 +16,14 @@
 
 ## 安装
 
+用 [skills](https://github.com/vercel-labs/skills) CLI：
+
+```bash
+npx skills add xiaoxiunique/dev-chrome-skills -g      # 全局安装；不加 -g 装到当前项目
+```
+
+或手动 clone：
+
 ```bash
 # Claude Code
 git clone https://github.com/xiaoxiunique/dev-chrome-skills ~/.claude/skills/dev-chrome-skills
@@ -24,6 +32,8 @@ git clone https://github.com/xiaoxiunique/dev-chrome-skills ~/.claude/skills/dev
 
 ln -s ~/.claude/skills/dev-chrome-skills/scripts/devchrome ~/.local/bin/devchrome   # 确保 ~/.local/bin 在 PATH 上
 ```
+
+两种方式装完都建议把 `scripts/devchrome` 软链到 PATH 上（路径换成实际的安装目录）。
 
 ## 常用命令
 
