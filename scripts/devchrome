@@ -1,0 +1,543 @@
+#!/usr/bin/env bash
+# devchrome — 独立管理 Debug Chrome 实例（Dev Profile），不依赖「全占的工具箱」App 是否运行。
+# 与 App 共用同一份配置（debug-profiles.json）和同一批数据目录，启动参数也与 App 一致，
+# 所以两边看到的是同一批实例；App 开着时它的 Debug 页面会同步显示 CLI 的改动。
+set -euo pipefail
+
+CFG_DIR="${DEVCHROME_HOME:-$HOME/Library/Application Support/Browser Modes}"
+CONFIG="$CFG_DIR/debug-profiles.json"
+CHROME_APP="${DEVCHROME_CHROME_APP:-/Applications/Google Chrome.app}"
+STANDARD_PORT=9222
+PORT_MIN=9223
+PORT_MAX=9299
+NAME_RE='^[a-z0-9]+(-[a-z0-9]+)*$'
+DEFAULT_CONFIG='{"profiles":[{"id":"default","name":"Default Debug","debugPort":9222,"proxyEnabled":false,"proxyPort":8888,"dataDirectory":null}],"sharedDebugPort":true}'
+
+die() { echo "devchrome: $*" >&2; exit 1; }
+warn() { echo "devchrome: $*" >&2; }
+
+usage() {
+  cat <<'EOF'
+用法: devchrome <命令> [参数]        （独立运行，不需要打开全占的工具箱 App）
+
+查询
+  list [--json]                 列出全部 Dev Profile（名称 / ID / 端口 / 状态 / 代理 / 数据目录）
+  show <名称|ID>                单个 Profile 的完整状态（含 CDP 版本信息）
+  who <端口>                    谁在监听这个端口（Dev Profile 还是外部进程）
+  free-port                     在 9223–9299 里找一个空闲且未被其它 Profile 预留的端口
+  endpoint <名称|ID>            打印 CDP 地址 http://127.0.0.1:<端口>
+  cookies <名称|ID> [域名]      读取运行中实例的 Cookie：按打开的站点汇总；给域名则只输出该域的 Cookie 串
+  set-cookies <名称|ID> <域名> <cookie串>
+                                覆盖写入该站点 Cookie（先清空再写，domain=.站点 path=/，
+                                https 站点 secure）；须已打开该站点标签页，写完自动刷新
+  cdp <名称|ID|端口> <工具> [参数…]
+                                用 chrome-devtools CLI 操作该实例（工具/参数同 chrome-devtools-mcp，
+                                如 list_pages、take_snapshot 1）。每个端口一个独立 daemon，多实例可并行
+
+管理
+  create <名称> [--dir 路径]    新建（名称须符合 <平台>-<用途>[-序号]；默认数据目录自动分配）
+  start <名称|ID> [--port N|auto]
+                                启动；已在运行则直接复用。端口被占时默认报错，
+                                --port auto 自动改用空闲端口，--port N 指定端口
+  stop <名称|ID>                停止
+  set-port <名称|ID> <端口>     修改调试端口（须先停止；用完建议改回 9222）
+  proxy <名称|ID> on|off [--port N]
+                                启动时是否走 127.0.0.1 代理（默认 8888 = Charles；须先停止）
+  rename <名称|ID> <新名称>     改名（须先停止；ID 与数据目录不变）
+  delete <名称|ID> --yes        删除（须先停止；数据目录移到废纸篓）
+EOF
+}
+
+# ── 配置读写（与 App 同一文件、同一格式）──
+
+config() {
+  if [[ -f $CONFIG ]]; then
+    jq -e '.profiles | type == "array"' "$CONFIG" >/dev/null 2>&1 || die "配置文件损坏：$CONFIG"
+    # 与 App 一致：缺 sharedDebugPort 标记的旧配置，端口统一规整为 9222
+    jq -c 'if .sharedDebugPort then . else (.profiles |= map(.debugPort = 9222)) | .sharedDebugPort = true end' "$CONFIG"
+  else
+    echo "$DEFAULT_CONFIG"
+  fi
+}
+
+save_config() { # stdin: 完整配置 JSON；临时文件 + rename，避免和 App 同时读写时读到半个文件
+  mkdir -p "$CFG_DIR"
+  local tmp="$CONFIG.devchrome.tmp"
+  jq '.' >"$tmp" && mv "$tmp" "$CONFIG"
+}
+
+set_fields() { # set_fields <id> <JSON 片段，如 {"debugPort":9223}>
+  config | jq --arg id "$1" --argjson patch "$2" '.profiles |= map(if .id == $id then . + $patch else . end)' | save_config
+}
+
+root_of() { # Profile 的数据目录（规则与 App 相同）
+  jq -r --arg base "$CFG_DIR" \
+    'if .dataDirectory then .dataDirectory elif .id == "default" then "\($base)/Chrome Debug" else "\($base)/Chrome Debug Profiles/\(.id)" end' <<<"$1"
+}
+
+resolve() { # 按 ID 或名称（不区分大小写）找到 Profile
+  local obj
+  obj=$(config | jq -c --arg q "$1" \
+    '.profiles | map(select(.id == $q or (.name | ascii_downcase) == ($q | ascii_downcase))) | first // empty')
+  [[ -n $obj ]] || die "没有名称或 ID 为「${1}」的 Dev Profile，先用 devchrome list 查看"
+  printf '%s\n' "$obj"
+}
+
+# ── 进程与端口 ──
+
+main_pid() { # 使用该数据目录的 Chrome 主进程 PID（子进程带 --type=，跳过）
+  # 只认命令行以 Chrome 可执行文件开头的进程，否则 awk/grep 自己的 argv 也会命中
+  ps -axww -o pid=,command= | awk -v needle="--user-data-dir=$1" -v exe="$CHROME_APP/Contents/MacOS/" '
+    index($0, "--type=") { next }
+    {
+      pid = $1; cmd = substr($0, index($0, $2))
+      if (index(cmd, exe) != 1) next
+      i = index(cmd, needle); if (!i) next
+      rest = substr(cmd, i + length(needle))
+      # 不能用 exit：awk 提前退出会让 ps 收到 SIGPIPE，pipefail + set -e 下脚本会无声退出
+      if (!found && (rest == "" || substr(rest, 1, 3) == " --")) { print pid; found = 1 }
+    }'
+}
+
+listener_pid() { lsof -nP -t -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | head -1 || true; }
+
+status_of() { # Profile JSON → 带运行状态的 JSON
+  local p=$1 root pid port reachable=false
+  root=$(root_of "$p")
+  port=$(jq -r '.debugPort' <<<"$p")
+  pid=$(main_pid "$root")
+  [[ -n $pid && $(listener_pid "$port") == "$pid" ]] && reachable=true
+  jq -c --arg root "$root" --arg pid "$pid" --argjson reach "$reachable" \
+    '{id, name, debugPort, proxyEnabled, proxyPort, customDataDirectory: .dataDirectory, dataDirectory: $root,
+      running: ($pid != ""), pid: (if $pid == "" then null else ($pid | tonumber) end),
+      endpoint: "http://127.0.0.1:\(.debugPort)", reachable: $reach}' <<<"$p"
+}
+
+all_status() { config | jq -c '.profiles[]' | while IFS= read -r p; do status_of "$p"; done | jq -s '.'; }
+
+describe_owner() { # 说明端口占用者：哪个 Dev Profile，或外部进程
+  local port=$1 pid name
+  pid=$(listener_pid "$port")
+  [[ -n $pid ]] || { echo "端口 $port 空闲"; return; }
+  name=$(all_status | jq -r --argjson pid "$pid" 'map(select(.pid == $pid)) | first | .name // empty')
+  if [[ -n $name ]]; then
+    echo "端口 $port 被 Dev Profile「${name}」占用"
+  else
+    echo "端口 $port 被外部进程占用（不是 Dev Profile，不要擅自结束它）：$(ps -o pid=,command= -p "$pid" | cut -c1-400)"
+  fi
+}
+
+free_port() {
+  local reserved p
+  reserved=$(config | jq -r '.profiles[].debugPort' | sort -u)
+  for (( p = PORT_MIN; p <= PORT_MAX; p++ )); do
+    grep -qx "$p" <<<"$reserved" && continue
+    [[ -z $(listener_pid "$p") ]] && { echo "$p"; return; }
+  done
+  die "$PORT_MIN–$PORT_MAX 没有空闲端口"
+}
+
+# ── 校验 ──
+
+check_name() { # check_name <名称> [排除的 ID]
+  local name=$1
+  [[ ${#name} -le 48 ]] || die "名称不能超过 48 个字符"
+  [[ $name =~ $NAME_RE ]] || die "名称「${name}」不符合规范：小写英文/数字，用 - 连接，格式 <平台>-<用途>[-序号]，如 douyin-crawl、xhs-login-2"
+  config | jq -e --arg n "$name" --arg id "${2:-}" \
+    'any(.profiles[]; .id != $id and (.name | ascii_downcase) == ($n | ascii_downcase))' >/dev/null \
+    && die "名称「${name}」已存在" || true
+}
+
+check_port() {
+  [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1024 && $1 <= 65535 )) || die "端口须是 1024–65535 的整数：$1"
+}
+
+require_stopped() {
+  [[ -z $(main_pid "$(root_of "$1")") ]] || die "「$(jq -r '.name' <<<"$1")」正在运行，请先 devchrome stop"
+}
+
+normalize_dir() { # 与 App 相同的自定义数据目录规则
+  local p=$1 b
+  case $p in
+    "~") p=$HOME ;;
+    "~/"*) p="$HOME/${p#\~/}" ;;
+  esac
+  [[ $p == /* ]] || die "数据目录必须是绝对路径或以 ~/ 开头"
+  [[ /$p/ == */../* ]] && die "数据目录不能包含 .."
+  p=${p%/}
+  for b in "Google/Chrome" "Microsoft Edge" "BraveSoftware/Brave-Browser"; do
+    b="$HOME/Library/Application Support/$b"
+    [[ $p == "$b" || $p == "$b/"* ]] && die "请选择正常浏览器数据目录之外的位置"
+  done
+  if [[ -e $p ]]; then
+    [[ -d $p ]] || die "数据目录指向的是文件"
+    [[ -z $(ls -A "$p") ]] || die "数据目录必须是空目录"
+  fi
+  printf '%s\n' "$p"
+}
+
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time * 1000'; }
+
+# ── 命令 ──
+
+cmd_list() {
+  local data
+  data=$(all_status)
+  if [[ ${1:-} == --json ]]; then printf '%s\n' "$data" | jq '.'; return; fi
+  {
+    printf 'NAME\tID\tPORT\tSTATE\tPROXY\tDATA_DIR\n'
+    jq -r '.[] | [.name, .id, .debugPort,
+      (if .running then (if .reachable then "running" else "running(cdp-down)" end) else "stopped" end),
+      (if .proxyEnabled then (.proxyPort | tostring) else "-" end), .dataDirectory] | @tsv' <<<"$data"
+  } | column -t -s $'\t'
+}
+
+cmd_show() {
+  local s
+  s=$(status_of "$(resolve "$1")")
+  jq '.' <<<"$s"
+  if [[ $(jq -r '.reachable' <<<"$s") == true ]]; then
+    curl -s -m 3 "$(jq -r '.endpoint' <<<"$s")/json/version" | jq '{Browser, webSocketDebuggerUrl}' || true
+  fi
+}
+
+cmd_create() {
+  local name=${1:-} dir="" profiles id ts suffix=0 root
+  [[ -n $name ]] || die "用法: devchrome create <名称> [--dir 路径]"
+  shift
+  if [[ ${1:-} == --dir ]]; then
+    [[ -n ${2:-} ]] || die "--dir 需要路径"
+    dir=$(normalize_dir "$2")
+  fi
+  check_name "$name"
+  profiles=$(config)
+  ts=$(now_ms)
+  id="profile-$ts"
+  while jq -e --arg id "$id" 'any(.profiles[]; .id == $id)' <<<"$profiles" >/dev/null; do
+    suffix=$((suffix + 1)); id="profile-$ts-$suffix"
+  done
+  local new
+  new=$(jq -nc --arg id "$id" --arg n "$name" --arg d "$dir" \
+    '{id: $id, name: $n, debugPort: 9222, proxyEnabled: false, proxyPort: 8888, dataDirectory: (if $d == "" then null else $d end)}')
+  root=$(root_of "$new")
+  while IFS= read -r p; do
+    [[ $(root_of "$p") == "$root" ]] && die "数据目录已被其它 Profile 使用：$root"
+  done < <(jq -c '.profiles[]' <<<"$profiles")
+  jq --argjson p "$new" '.profiles += [$p] | .sharedDebugPort = true' <<<"$profiles" | save_config
+  jq '{id, name, debugPort}' <<<"$new"
+}
+
+cmd_start() {
+  local q=${1:-} want="" p id name port root pid
+  [[ -n $q ]] || die "用法: devchrome start <名称|ID> [--port N|auto]"
+  shift
+  if [[ ${1:-} == --port ]]; then want=${2:-}; [[ -n $want ]] || die "--port 需要 N 或 auto"; fi
+  p=$(resolve "$q")
+  id=$(jq -r '.id' <<<"$p"); name=$(jq -r '.name' <<<"$p"); port=$(jq -r '.debugPort' <<<"$p")
+  root=$(root_of "$p")
+
+  if [[ -n $(main_pid "$root") ]]; then
+    echo "「${name}」已在运行，直接复用：http://127.0.0.1:$port"
+    return
+  fi
+  [[ -d $CHROME_APP ]] || die "没有找到 Google Chrome：$CHROME_APP"
+
+  if [[ -n $want && $want != auto ]]; then
+    check_port "$want"
+    if [[ $want != "$port" ]]; then set_fields "$id" "{\"debugPort\":$want}"; port=$want; fi
+  fi
+  if [[ -n $(listener_pid "$port") ]]; then
+    if [[ $want == auto ]]; then
+      warn "$(describe_owner "$port")"
+      port=$(free_port)
+      set_fields "$id" "{\"debugPort\":$port}"
+      warn "已把「${name}」的调试端口改为 $port"
+    else
+      die "$(describe_owner "$port")。可用 --port auto 改用空闲端口，或先停掉占用者（外部进程须先问用户）"
+    fi
+  fi
+  p=$(resolve "$id")
+  if [[ $(jq -r '.proxyEnabled' <<<"$p") == true && $(jq -r '.proxyPort' <<<"$p") == "$port" ]]; then
+    die "调试端口和代理端口不能相同（$port）"
+  fi
+
+  mkdir -p "$root"
+  local args=(
+    "--user-data-dir=$root"
+    "--remote-debugging-address=127.0.0.1"
+    "--remote-debugging-port=$port"
+    "--no-first-run"
+    "--no-default-browser-check"
+    "--disable-extensions"
+    "--restore-last-session"
+  )
+  if [[ $(jq -r '.proxyEnabled' <<<"$p") == true ]]; then
+    local proxy_port
+    proxy_port=$(jq -r '.proxyPort' <<<"$p")
+    args+=("--proxy-server=http://127.0.0.1:$proxy_port")
+    [[ -n $(listener_pid "$proxy_port") ]] || warn "代理端口 $proxy_port 上没有服务在监听（Charles 没开？），网页会打不开"
+  fi
+  open -na "$CHROME_APP" --args "${args[@]}" || die "Chrome 启动命令失败"
+
+  local i
+  for (( i = 0; i < 30; i++ )); do
+    pid=$(main_pid "$root")
+    if [[ -n $pid && $(listener_pid "$port") == "$pid" ]]; then
+      echo "「${name}」CDP 就绪：http://127.0.0.1:$port"
+      [[ $port == "$STANDARD_PORT" ]] || warn "注意：端口不是 9222，按 9222 配置的 chrome-devtools / js-reverse MCP 连不到它（见 SKILL.md「MCP」一节）"
+      return
+    fi
+    sleep 0.5
+  done
+  die "已发起启动，但 15 秒内 http://127.0.0.1:$port 没有就绪，用 devchrome show $q 排查"
+}
+
+cmd_stop() {
+  local p name pid i cli
+  p=$(resolve "${1:-}")
+  name=$(jq -r '.name' <<<"$p")
+  pid=$(main_pid "$(root_of "$p")")
+  [[ -n $pid ]] || { echo "「${name}」未在运行"; return; }
+  cli=$(cdp_cli)
+  [[ -n $cli ]] && CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1 "$cli" stop --sessionId "$(jq -r '.debugPort' <<<"$p")" >/dev/null 2>&1 || true
+  kill -TERM "$pid" || die "无法停止 PID $pid"
+  for (( i = 0; i < 40; i++ )); do
+    [[ -z $(main_pid "$(root_of "$p")") ]] && { echo "「${name}」已停止"; return; }
+    sleep 0.25
+  done
+  die "「${name}」还在退出中，稍后再试"
+}
+
+cmd_set_port() {
+  local p
+  [[ $# -eq 2 ]] || die "用法: devchrome set-port <名称|ID> <端口>"
+  check_port "$2"
+  p=$(resolve "$1")
+  require_stopped "$p"
+  [[ $(jq -r '.proxyEnabled' <<<"$p") == true && $(jq -r '.proxyPort' <<<"$p") == "$2" ]] && die "调试端口和代理端口不能相同"
+  set_fields "$(jq -r '.id' <<<"$p")" "{\"debugPort\":$2}"
+  echo "「$(jq -r '.name' <<<"$p")」调试端口已设为 $2"
+}
+
+cmd_proxy() {
+  local p state=${2:-} proxy_port
+  [[ $state == on || $state == off ]] || die "用法: devchrome proxy <名称|ID> on|off [--port N]"
+  p=$(resolve "$1")
+  require_stopped "$p"
+  proxy_port=$(jq -r '.proxyPort' <<<"$p")
+  if [[ ${3:-} == --port ]]; then check_port "${4:-}"; proxy_port=$4; fi
+  [[ $state == on && $proxy_port == $(jq -r '.debugPort' <<<"$p") ]] && die "代理端口不能和调试端口相同"
+  set_fields "$(jq -r '.id' <<<"$p")" "{\"proxyEnabled\":$([[ $state == on ]] && echo true || echo false),\"proxyPort\":$proxy_port}"
+  if [[ $state == on ]]; then
+    echo "「$(jq -r '.name' <<<"$p")」启动时将走代理 http://127.0.0.1:$proxy_port"
+  else
+    echo "「$(jq -r '.name' <<<"$p")」启动时不再走代理"
+  fi
+}
+
+cmd_rename() {
+  local p
+  [[ $# -eq 2 ]] || die "用法: devchrome rename <名称|ID> <新名称>"
+  p=$(resolve "$1")
+  check_name "$2" "$(jq -r '.id' <<<"$p")"
+  require_stopped "$p"
+  set_fields "$(jq -r '.id' <<<"$p")" "$(jq -nc --arg n "$2" '{name: $n}')"
+  echo "「$(jq -r '.name' <<<"$p")」已改名为「${2}」"
+}
+
+cmd_delete() {
+  local p id root dest=""
+  [[ ${2:-} == --yes ]] || die "删除会把数据目录（含登录态）移到废纸篓。确认后执行: devchrome delete <名称|ID> --yes"
+  p=$(resolve "$1")
+  require_stopped "$p"
+  id=$(jq -r '.id' <<<"$p")
+  root=$(root_of "$p")
+  if [[ -e $root ]]; then
+    mkdir -p "$HOME/.Trash"
+    dest="$HOME/.Trash/Browser Modes $id $(date +%s)"
+    mv "$root" "$dest" || die "无法把数据目录移到废纸篓：$root"
+  fi
+  if ! config | jq --arg id "$id" '.profiles |= map(select(.id != $id))' | save_config; then
+    [[ -n $dest ]] && mv "$dest" "$root"
+    die "写配置失败，已把数据目录放回原处"
+  fi
+  echo "「$(jq -r '.name' <<<"$p")」已删除${dest:+，数据目录在废纸篓：$dest}"
+}
+
+cdp_ws() { # 运行中 Profile 的 browser 级 CDP WebSocket 地址
+  local s
+  command -v node >/dev/null || die "该命令需要 node（≥ 22，自带 WebSocket）"
+  s=$(status_of "$(resolve "${1:-}")")
+  [[ $(jq -r '.reachable' <<<"$s") == true ]] || die "「$(jq -r '.name' <<<"$s")」没在运行或 CDP 不可达"
+  curl -s -m 3 "$(jq -r '.endpoint' <<<"$s")/json/version" | jq -r '.webSocketDebuggerUrl'
+}
+
+cdp_cookies() { # cdp_cookies <ws> read [域名] | write <域名> <cookie串>
+  node -e '
+const [wsUrl, mode, domainArg, cookieInput] = process.argv.slice(1);
+const fail = (m) => { console.error("devchrome: " + m); process.exit(1); };
+const sock = new WebSocket(wsUrl);
+let seq = 0; const pending = new Map();
+const call = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+  const id = ++seq; pending.set(id, { resolve, reject });
+  sock.send(JSON.stringify(sessionId ? { id, method, params, sessionId } : { id, method, params }));
+});
+sock.onmessage = (event) => {
+  const msg = JSON.parse(event.data); const p = pending.get(msg.id);
+  if (!p) return; pending.delete(msg.id);
+  msg.error ? p.reject(new Error(msg.error.message)) : p.resolve(msg.result);
+};
+sock.onerror = () => fail("CDP 连接失败");
+setTimeout(() => fail("CDP 超时"), 15000);
+// 与 App 相同：按注册域合并子域名（含 com.cn / co.uk 这类二级后缀）
+const siteKey = (host) => {
+  host = host.replace(/\.$/, "").replace(/^\./, "").toLowerCase();
+  if (/^[\d.]+$/.test(host) || host.includes(":") || !host.includes(".")) return host;
+  const l = host.split("."), n = l.length;
+  const second = n >= 3 && l[n - 1].length === 2 && ["com", "net", "org", "gov", "edu", "co", "ac"].includes(l[n - 2]);
+  return l.slice(second ? -3 : -2).join(".");
+};
+const matches = (cookieDomain, site) => {
+  const d = cookieDomain.replace(/^\./, "").toLowerCase();
+  return d === site || d.endsWith("." + site);
+};
+const jarFor = (cookies, site) => {
+  const jar = new Map();
+  for (const c of cookies) if (matches(c.domain, site)) jar.set(c.name, c.value);
+  return jar;
+};
+const str = (jar) => [...jar].map(([k, v]) => `${k}=${v}`).join("; ");
+const webPages = (infos) => infos.filter((t) => t.type === "page" && /^https?:\/\//.test(t.url));
+// 与 App 的 parse_cookie_pairs 一致：可带 Cookie: 前缀，; 或换行分隔，同名后者覆盖
+const parsePairs = (input) => {
+  const body = input.trim().replace(/^cookie:/i, "");
+  const pairs = new Map();
+  for (const part of body.split(/[;\r\n]/)) {
+    const i = part.indexOf("="); if (i < 0) continue;
+    const name = part.slice(0, i).trim(); if (!name) continue;
+    pairs.set(name, part.slice(i + 1).trim());
+  }
+  return pairs;
+};
+async function read() {
+  const { cookies } = await call("Storage.getCookies");
+  if (domainArg) { console.log(str(jarFor(cookies, siteKey(domainArg)))); return; }
+  const sites = new Map(); let tabCount = 0;
+  for (const t of webPages((await call("Target.getTargets")).targetInfos)) {
+    tabCount++;
+    const key = siteKey(new URL(t.url).hostname);
+    const s = sites.get(key) || { domain: key, tabCount: 0, titles: [] };
+    s.tabCount++; if (t.title) s.titles.push(t.title); sites.set(key, s);
+  }
+  const out = [...sites.values()].map((s) => {
+    const jar = jarFor(cookies, s.domain);
+    return { ...s, cookieCount: jar.size, cookieString: str(jar) };
+  });
+  console.log(JSON.stringify({ tabCount, sites: out }, null, 2));
+}
+// 与 App 的 write_debug_cookies 一致：须有该站点的标签页；先清空站点现有 Cookie，
+// 再以 domain=.site、path=/、secure=(站点任一标签是 https) 写入，最后刷新该站点所有标签页
+async function write() {
+  const site = siteKey(domainArg);
+  const pairs = parsePairs(cookieInput || "");
+  if (!pairs.size) fail("没有解析到有效的 Cookie（格式应为 name=value; name=value）");
+  const tabs = webPages((await call("Target.getTargets")).targetInfos)
+    .filter((t) => siteKey(new URL(t.url).hostname) === site);
+  if (!tabs.length) fail(`${site} 没有打开的标签页，先在浏览器里打开它再写入`);
+  const secure = tabs.some((t) => t.url.startsWith("https://"));
+  const sessions = [];
+  for (const t of tabs) {
+    try { sessions.push((await call("Target.attachToTarget", { targetId: t.targetId, flatten: true })).sessionId); } catch {}
+  }
+  if (!sessions.length) fail("附加到标签页失败");
+  const { cookies } = await call("Storage.getCookies");
+  let cleared = 0;
+  for (const c of cookies) {
+    if (!c.name || !matches(c.domain, site)) continue;
+    try { await call("Network.deleteCookies", { name: c.name, domain: c.domain, path: c.path || "/" }, sessions[0]); cleared++; } catch {}
+  }
+  const list = [...pairs].map(([name, value]) => ({ name, value, domain: "." + site, path: "/", secure }));
+  try { await call("Storage.setCookies", { cookies: list }); }
+  catch (error) { fail("Cookie 写入失败（浏览器拒绝）：" + error.message); }
+  const now = jarFor((await call("Storage.getCookies")).cookies, site);
+  const written = list.filter((c) => now.get(c.name) === c.value).length;
+  if (!written) fail("Cookie 写入失败（浏览器拒绝了全部 Cookie）");
+  let reloaded = 0;
+  for (const sid of sessions) {
+    try { await call("Page.enable", {}, sid); await call("Page.reload", { ignoreCache: false }, sid); reloaded++; } catch {}
+  }
+  console.log(JSON.stringify({ site, secure, cleared, written, requested: list.length, reloadedTabs: reloaded }));
+}
+sock.onopen = async () => {
+  try { await (mode === "write" ? write() : read()); process.exit(0); }
+  catch (error) { fail(error.message); }
+};' "$@"
+}
+
+cmd_cookies() {
+  local ws
+  ws=$(cdp_ws "${1:-}")
+  cdp_cookies "$ws" read "${2:-}"
+}
+
+cmd_set_cookies() {
+  local ws
+  [[ $# -eq 3 && -n $2 && -n $3 ]] || die "用法: devchrome set-cookies <名称|ID> <域名> <cookie串>（该站点须已在实例里打开）"
+  ws=$(cdp_ws "$1")
+  cdp_cookies "$ws" write "$2" "$3"
+}
+
+cdp_cli() { printf '%s\n' "${DEVCHROME_CDP_CLI:-$(command -v chrome-devtools || true)}"; }
+
+cdp_port() { # 名称/ID → 运行中实例的端口；数字 → 该端口上运行中的 Dev Profile
+  local s p
+  if [[ $1 =~ ^[0-9]+$ ]]; then
+    s=$(all_status | jq -c --argjson port "$1" 'map(select(.debugPort == $port and .reachable)) | first // empty')
+    [[ -n $s ]] || die "端口 $1 上没有运行中的 Dev Profile（$(describe_owner "$1")）"
+  else
+    p=$(resolve "$1") || exit 1
+    s=$(status_of "$p")
+    [[ $(jq -r '.reachable' <<<"$s") == true ]] || die "「$(jq -r '.name' <<<"$s")」没在运行或 CDP 不可达，先 devchrome start"
+  fi
+  jq -r '.debugPort' <<<"$s"
+}
+
+cmd_cdp() {
+  local cli port st
+  [[ $# -ge 2 ]] || die "用法: devchrome cdp <名称|ID|端口> <工具> [参数…]（如 list_pages、take_snapshot 1）"
+  cli=$(cdp_cli)
+  [[ -n $cli ]] || die "需要 chrome-devtools CLI：npm install -g chrome-devtools-mcp@latest"
+  port=$(cdp_port "$1")
+  shift
+  export CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1
+  # session id = 端口。必须先自己带 --browserUrl 起 daemon：CLI 自动起的 daemon 不带它，会另外拉起一个 Chrome
+  st=$("$cli" status --sessionId "$port" 2>&1 || true)
+  if [[ $st != *"is running"* || $st != *"version=$("$cli" --version)"* ]]; then
+    "$cli" start --sessionId "$port" --browserUrl "http://127.0.0.1:$port" --no-usage-statistics >/dev/null 2>&1 \
+      || die "chrome-devtools daemon 启动失败（端口 $port）"
+  fi
+  exec "$cli" "$@" --sessionId "$port"
+}
+
+for tool in jq curl lsof; do command -v "$tool" >/dev/null || die "需要 $tool"; done
+sub=${1:-help}
+shift || true
+case $sub in
+  list) cmd_list "$@" ;;
+  show) [[ $# -ge 1 ]] || die "用法: devchrome show <名称|ID>"; cmd_show "$1" ;;
+  who) [[ $# -eq 1 ]] || die "用法: devchrome who <端口>"; check_port "$1"; describe_owner "$1" ;;
+  free-port) free_port ;;
+  endpoint) echo "http://127.0.0.1:$(resolve "${1:-}" | jq -r '.debugPort')" ;;
+  cookies) cmd_cookies "$@" ;;
+  set-cookies) cmd_set_cookies "$@" ;;
+  cdp) cmd_cdp "$@" ;;
+  create) cmd_create "$@" ;;
+  start) cmd_start "$@" ;;
+  stop) cmd_stop "$@" ;;
+  set-port) cmd_set_port "$@" ;;
+  proxy) cmd_proxy "$@" ;;
+  rename) cmd_rename "$@" ;;
+  delete) cmd_delete "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac
