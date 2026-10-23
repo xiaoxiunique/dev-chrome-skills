@@ -1,7 +1,7 @@
 ---
 name: dev-chrome-skills
 description: |
-  DevChromeSkills —— 统一管理本机 Debug Chrome 实例（「全占的工具箱」里的 Dev Profile）。
+  DevChromeSkills —— 用 devchrome CLI 统一管理本机 Debug Chrome 实例（Dev Profile：独立数据目录 + 调试端口 + 可选代理）。
   任何需要用 Chrome 浏览器完成的任务（打开网页、登录、抓 Cookie、CDP / chrome-devtools MCP / js-reverse MCP
   调试、爬虫逆向、自动化）都必须先用本 skill 查询、创建、启动实例，禁止自己另起 Chrome 或用临时 user-data-dir。
   用户提到「Debug Chrome」「调试浏览器」「9222」「远程调试端口」「CDP」「chrome-devtools MCP」「开个浏览器」时使用。
@@ -9,11 +9,12 @@ description: |
 
 # DevChromeSkills
 
-本机所有调试用 Chrome 都由 macOS App「全占的工具箱」（`/Applications/全占的工具箱.app`）的 **Dev Profile** 统一管理：
+本机所有调试用 Chrome 都由命令行工具 `devchrome`（同目录 `scripts/devchrome`）以 **Dev Profile** 统一管理：
 每个 Profile = 一个独立的 `--user-data-dir`（登录态互相隔离）+ 一个调试端口（默认共用 `9222`）+ 可选 Charles 代理。
-命令行工具 `devchrome`（同目录 `scripts/devchrome`）**独立运行，不需要打开 App**：它直接读写与 App 相同的配置文件
-`~/Library/Application Support/Browser Modes/debug-profiles.json`，用与 App 相同的数据目录和启动参数拉起 Chrome，
-所以 CLI 和 App 管理的是同一批实例，App 开着时它的 Debug 页面也会显示 CLI 的改动。
+`devchrome` 是独立的 CLI，配置保存在 `~/Library/Application Support/Browser Modes/debug-profiles.json`（不存在时自动创建）。
+
+可选：如果本机装了 macOS App「全占的工具箱」，它的 Debug 页面和 `devchrome` 共用同一份配置、数据目录和启动参数，
+两边管理的是同一批实例；App 开着时也会显示 CLI 的改动。没装 App 不影响任何功能。
 
 ## 铁律
 
@@ -22,13 +23,13 @@ description: |
    需要浏览器 → 用 `devchrome` 复用或新建 Dev Profile。
 2. **先查再建。** 动手前先 `devchrome list`，同平台同用途已有 Profile 就复用（登录态在里面），不要重复创建。
 3. **不碰外部进程。** 端口被非 Dev Profile 的进程占用时，报告给用户（`devchrome who <端口>` 的输出），不要 kill。
-4. **不手改配置。** 不要编辑 `debug-profiles.json` 或 Profile 数据目录，一律走 `devchrome`（或 App 的 Debug 页面）。
+4. **不手改配置。** 不要编辑 `debug-profiles.json` 或 Profile 数据目录，一律走 `devchrome`（装了 App 的话也可以用它的 Debug 页面）。
 5. **删除要用户确认。** 删除会把数据目录（含登录态）移到废纸篓。
 6. 用完是否停止：用户没说就保持运行（方便复用）；任务明确结束或用户要求时 `devchrome stop`。
 
 ## 前置条件
 
-- 不需要 App 在运行。需要 `/Applications/Google Chrome.app`、`jq`、`curl`、`lsof`；`cookies` / `set-cookies` 另需 `node` ≥ 22。
+- macOS。需要 `/Applications/Google Chrome.app`、`jq`、`curl`、`lsof`；`cookies` / `set-cookies` 另需 `node` ≥ 22；`cdp` 另需 `chrome-devtools-mcp`（`npm install -g chrome-devtools-mcp@latest`）。
 - 环境变量（一般不用设）：`DEVCHROME_HOME` 覆盖配置目录，`DEVCHROME_CHROME_APP` 覆盖 Chrome 路径。
 - `devchrome` 已软链到 `~/.local/bin/devchrome`（在 PATH 上），任意目录直接运行 `devchrome …` 即可。
   若 `command -v devchrome` 找不到，用完整路径 `<本 skill 目录>/scripts/devchrome`（Claude Code：`~/.claude/skills/dev-chrome-skills/scripts/devchrome`；
@@ -109,7 +110,7 @@ args = ["chrome-devtools-mcp@latest", "--browserUrl", "http://127.0.0.1:9222"]
 
 [mcp_servers.js-reverse]
 command = "node"
-args = ["/Users/not/projects/devs/逆向/mcp/JSReverser-MCP/build/src/index.js", "--browserUrl", "http://127.0.0.1:9222"]
+args = ["/path/to/JSReverser-MCP/build/src/index.js", "--browserUrl", "http://127.0.0.1:9222"]
 ```
 
 Claude Code 对应的写法（`~/.claude.json` 的 `mcpServers`，或 `claude mcp add`）：
@@ -153,7 +154,7 @@ devchrome cdp 9223 <工具> --help                        # 查某个工具的�
 - 输出默认是 Markdown，要 JSON 加 `--output-format json`。
 - js-reverse 没有 CLI，hook / 断点仍然只能通过 MCP（连 9222）用：逆向任务要把目标 Profile 跑在 9222 上。
 
-## 启动参数（与 App 一致，供排查）
+## 启动参数（供排查）
 
 `--user-data-dir=<数据目录> --remote-debugging-address=127.0.0.1 --remote-debugging-port=<端口> --no-first-run
 --no-default-browser-check --disable-extensions --restore-last-session`，开启代理时加 `--proxy-server=http://127.0.0.1:<代理端口>`（Charles 默认 8888）。
